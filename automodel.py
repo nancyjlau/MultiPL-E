@@ -1,6 +1,3 @@
-"""
-This script produces completions for roughly any AutoModelForCausalLM.
-"""
 from multipl_e.completions import make_main, stop_at_stop_token, partial_arg_parser
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -13,7 +10,10 @@ class Model:
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         self.model = AutoModelForCausalLM.from_pretrained(
             name, revision=revision, torch_dtype=dtype, trust_remote_code=True, **model_kwargs
-        ).cuda()
+        )
+        self.model = torch.nn.DataParallel(self.model)  # Use multiple GPUs if available
+        self.model = self.model.cuda()
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name or name,
             revision=tokenizer_revision or revision,
@@ -45,7 +45,7 @@ class Model:
         temperature: float,
         top_p: float,
     ):
-        self.model.eval() # Not essential, but just in case.
+        self.model.eval()  # Not essential, but just in case.
 
         inputs = self.tokenizer(
             prompts,
@@ -56,9 +56,8 @@ class Model:
             max_length=max_length - 1,
         ).to("cuda")
 
-
         with torch.no_grad():
-            output = self.model.generate(
+            output = self.model.module.generate(  # Access the original model within DataParallel
                 **inputs,
                 do_sample=True,
                 use_cache=True,
@@ -81,21 +80,10 @@ class Model:
 
     def _remove_padding_and_stop_at_special_tokens(self, token_id_list: List[int]):
         pad_token_id = self.tokenizer.pad_token_id
-        # bos_token_id may be None
         bos_token_id = self.tokenizer.bos_token_id
-        # Removes all the pad tokens or BOS tokens on the left-hand side using the 
-        # pad token ID. This is more robust than looking for the string representation of
-        # the pad token. Thus the prompt can begin with the literal string
-        # "<|endoftext|>" (which is a common representation of the pad token).
         left_padding_removed = itertools.dropwhile(
             self._is_pad_or_bos_token_id, token_id_list
         )
-        # Returns all tokens to the left of the first special token. This has
-        # the effect of removing all right-hand padding. Moreover, it also
-        # stops generation at other special tokens. For example, consider
-        # StarCoder 2, where a completion may reach the end of a file and then
-        # continue onto a second file: A<file_sep>B. The code below removes
-        # <file_sep>B and only produces A.
         right_specials_removed = itertools.takewhile(
             self._is_normal_token_id, left_padding_removed
         )
@@ -110,8 +98,7 @@ class Model:
             clean_up_tokenization_spaces=False,
             skip_special_tokens=False,
         )
-        # Skip the prompt (which may even have stop_tokens)
-        return detok_hypo_str[len(prompt) :]
+        return detok_hypo_str[len(prompt):]
 
     def completions(
         self, prompts: str, max_tokens: int, temperature: float, top_p, stop
@@ -133,9 +120,6 @@ class Model:
 
 
 def automodel_partial_arg_parser():
-    """
-    This is also used by peftmodel.py.
-    """
     args = partial_arg_parser()
     args.add_argument("--name", type=str, required=True)
     args.add_argument("--revision", type=str)
@@ -147,10 +131,6 @@ def automodel_partial_arg_parser():
 
 
 def do_name_override(args):
-    """
-    Applies the --name-override flag, or uses the model name, correcting / and - which the rest of
-    the toolchain does not like.
-    """
     if args.name_override:
         name = args.name_override
     else:
